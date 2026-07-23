@@ -138,6 +138,7 @@ async fn fetch_and_export(
             payload_size: offer.payload_size,
             file_count: offer.file_count,
             resumed_bytes: local.local_bytes(),
+            sender_version: offer.version.clone(),
         })
         .await
         .ok();

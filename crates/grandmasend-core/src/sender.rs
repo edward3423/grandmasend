@@ -68,6 +68,15 @@ pub struct SendSummary {
 /// (which sets it) and the blobs accept filter (which enforces it).
 type Binding = Arc<Mutex<Option<EndpointId>>>;
 
+/// True when `remote` is the bound receiver. A poisoned lock fails closed:
+/// nobody is served rather than anybody.
+fn is_bound_to(binding: &Binding, remote: EndpointId) -> bool {
+    binding
+        .lock()
+        .map(|bound| *bound == Some(remote))
+        .unwrap_or(false)
+}
+
 /// Serve one payload until the receiver acks completion. Never times out;
 /// cancellation (ctrl-c) is the caller's job via future drop.
 pub async fn send(config: SendConfig, events: mpsc::Sender<SenderEvent>) -> Result<SendSummary> {
@@ -225,13 +234,16 @@ impl ProtocolHandler for ControlHandler {
             };
             let msg: ControlMsg = hello::read_frame(&mut recv).await.map_err(accept_err)?;
             match msg {
-                ControlMsg::Hello { version: _ } => {
+                ControlMsg::Hello { version } => {
                     // Binding: the first NodeId to redeem the code is the
                     // only one this send will ever serve. A rejected
                     // receiver sees a closed connection, indistinguishable
                     // from a sender that is not there.
                     let newly_bound = {
-                        let mut bound = self.binding.lock().unwrap();
+                        let Ok(mut bound) = self.binding.lock() else {
+                            conn.close(CLOSE_NOT_BOUND.into(), b"not bound");
+                            return Ok(());
+                        };
                         match *bound {
                             None => {
                                 *bound = Some(remote);
@@ -245,7 +257,10 @@ impl ProtocolHandler for ControlHandler {
                         }
                     };
                     self.events
-                        .send(SenderEvent::ReceiverConnected { id: remote })
+                        .send(SenderEvent::ReceiverConnected {
+                            id: remote,
+                            version,
+                        })
                         .await
                         .ok();
                     if newly_bound {
@@ -260,8 +275,7 @@ impl ProtocolHandler for ControlHandler {
                     send.finish().ok();
                 }
                 ControlMsg::Complete { hash } => {
-                    let is_bound = *self.binding.lock().unwrap() == Some(remote);
-                    if !is_bound || hash != self.offer.hash {
+                    if !is_bound_to(&self.binding, remote) || hash != self.offer.hash {
                         conn.close(CLOSE_NOT_BOUND.into(), b"not bound");
                         return Ok(());
                     }
@@ -271,8 +285,10 @@ impl ProtocolHandler for ControlHandler {
                     send.finish().ok();
                     // Flush the ack before the router shuts down.
                     send.stopped().await.ok();
-                    if let Some(tx) = self.complete.lock().unwrap().take() {
-                        tx.send(()).ok();
+                    if let Ok(mut guard) = self.complete.lock() {
+                        if let Some(tx) = guard.take() {
+                            tx.send(()).ok();
+                        }
                     }
                     return Ok(());
                 }
@@ -292,8 +308,7 @@ struct BoundBlobs {
 impl ProtocolHandler for BoundBlobs {
     async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), AcceptError> {
         let remote = conn.remote_id();
-        let is_bound = *self.binding.lock().unwrap() == Some(remote);
-        if !is_bound {
+        if !is_bound_to(&self.binding, remote) {
             conn.close(CLOSE_NOT_BOUND.into(), b"not bound");
             return Ok(());
         }

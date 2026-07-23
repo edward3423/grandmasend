@@ -40,6 +40,7 @@ impl Sender {
             .arg(payload)
             .arg("--print-addr")
             .env("GRANDMASEND_DATA_DIR", data_dir)
+            .env("GRANDMASEND_NO_UPDATE_CHECK", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -169,6 +170,7 @@ pub fn run_receiver(
         .arg("--sender-addr")
         .arg(addr_json)
         .env("GRANDMASEND_DATA_DIR", data_dir)
+        .env("GRANDMASEND_NO_UPDATE_CHECK", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn receiver");

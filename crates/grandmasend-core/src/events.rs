@@ -18,8 +18,12 @@ pub enum SenderEvent {
         /// discovery infrastructure.
         addr: EndpointAddr,
     },
-    /// A receiver established a control connection.
-    ReceiverConnected { id: EndpointId },
+    /// A receiver completed a hello on the control connection.
+    ReceiverConnected {
+        id: EndpointId,
+        /// The receiver's binary version from the frozen hello.
+        version: String,
+    },
     /// The first receiver redeemed the code; only this NodeId is served now.
     Bound { id: EndpointId },
     /// Cumulative payload bytes served this session.
@@ -39,6 +43,8 @@ pub enum ReceiverEvent {
         file_count: u64,
         /// Bytes already present locally from an earlier interrupted run.
         resumed_bytes: u64,
+        /// The sender's binary version from the frozen hello.
+        sender_version: String,
     },
     /// Cumulative verified bytes fetched this session (excludes resumed).
     Progress { offset: u64 },

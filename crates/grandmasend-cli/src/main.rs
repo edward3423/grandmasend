@@ -17,11 +17,14 @@ use grandmasend_core::{
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use tokio::sync::mpsc;
 
+mod update;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_millis(2500);
 
 /// Send any file, any size, to anyone who can type one command.
 #[derive(Parser, Debug)]
-#[command(version, about)]
+#[command(name = "grandmasend", version, about)]
 struct Args {
     #[clap(subcommand)]
     command: Commands,
@@ -40,10 +43,15 @@ enum Commands {
     #[clap(visible_alias = "recv")]
     Receive {
         /// The four words, in order; spaces or hyphens both work.
+        /// Prompted for interactively when omitted.
         code: Vec<String>,
         /// Destination directory; defaults to ~/Downloads.
         #[clap(long)]
         dest: Option<PathBuf>,
+        /// Transient run from the bootstrap script: prompt for the code,
+        /// skip the update check (the bootstrap always fetches latest).
+        #[clap(long, hide = true)]
+        transient: bool,
         /// Dial this endpoint address (JSON) instead of discovery. Debug/test hook.
         #[clap(long, hide = true)]
         sender_addr: Option<String>,
@@ -57,13 +65,42 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
     match args.command {
-        Commands::Send { path, print_addr } => send(path, print_addr).await,
+        Commands::Send { path, print_addr } => {
+            update::check_and_nag(VERSION, UPDATE_CHECK_TIMEOUT).await;
+            send(path, print_addr).await
+        }
         Commands::Receive {
             code,
             dest,
+            transient,
             sender_addr,
-        } => receive(code, dest, sender_addr).await,
-        Commands::Status => status(),
+        } => {
+            if !transient {
+                update::check_and_nag(VERSION, UPDATE_CHECK_TIMEOUT).await;
+            }
+            receive(code, dest, sender_addr).await
+        }
+        Commands::Status => {
+            update::check_and_nag(VERSION, UPDATE_CHECK_TIMEOUT).await;
+            status()
+        }
+    }
+}
+
+/// Read the code interactively; the transient receiver's whole interface.
+fn prompt_for_code() -> Result<Code> {
+    use std::io::Write;
+    loop {
+        eprint!("Type the four-word code, then press Enter: ");
+        std::io::stderr().flush().ok();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            anyhow::bail!("no code entered");
+        }
+        match line.parse::<Code>() {
+            Ok(code) => return Ok(code),
+            Err(cause) => eprintln!("{cause}. Try again."),
+        }
     }
 }
 
@@ -103,7 +140,9 @@ impl SpeedWindow {
                 break;
             }
         }
-        let (t0, p0) = *self.samples.front().unwrap();
+        let Some(&(t0, p0)) = self.samples.front() else {
+            return (0, None);
+        };
         let dt = now.duration_since(t0).as_secs_f64();
         if dt < 0.2 {
             return (0, None);
@@ -121,7 +160,7 @@ fn progress_bar(total: u64) -> ProgressBar {
         ProgressStyle::with_template(
             "[{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} {msg}",
         )
-        .unwrap()
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
         .progress_chars("#>-"),
     );
     pb
@@ -211,15 +250,18 @@ async fn send(path: PathBuf, print_addr: bool) -> Result<()> {
                     eprintln!("On the other machine, run grandmasend and type this code.");
                     eprintln!("Keep this window open until the transfer finishes.");
                     if print_addr {
-                        println!("ADDR {}", serde_json::to_string(&addr).unwrap());
+                        if let Ok(json) = serde_json::to_string(&addr) {
+                            println!("ADDR {json}");
+                        }
                     }
                 }
-                SenderEvent::ReceiverConnected { id } => {
+                SenderEvent::ReceiverConnected { id, version } => {
                     eprintln!(
                         "{} {}",
                         style("Receiver connected:").bold().cyan(),
                         id.fmt_short()
                     );
+                    warn_if_peer_newer("receiver", &version);
                 }
                 SenderEvent::Bound { id } => {
                     // Persist the binding so a revived send only serves the
@@ -277,7 +319,11 @@ async fn receive(
     dest: Option<PathBuf>,
     sender_addr: Option<String>,
 ) -> Result<()> {
-    let code: Code = code.join(" ").parse()?;
+    let code: Code = if code.is_empty() {
+        prompt_for_code()?
+    } else {
+        code.join(" ").parse()?
+    };
     let dest = match dest {
         Some(d) => d,
         None => default_downloads()?,
@@ -332,8 +378,10 @@ async fn receive(
                     payload_size,
                     file_count,
                     resumed_bytes,
+                    sender_version,
                 } => {
                     waiting_since = None;
+                    warn_if_peer_newer("sender", &sender_version);
                     eprintln!(
                         "Receiving {} ({}, {} file{})",
                         style(&name).bold(),
@@ -406,6 +454,17 @@ fn status() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Offline outdatedness signal: the frozen hello carries versions, so even
+/// with no internet we can tell when the peer runs newer. Warn and proceed.
+fn warn_if_peer_newer(role: &str, peer_version: &str) {
+    if update::is_older(VERSION, peer_version) {
+        eprintln!(
+            "Note: the {role} runs grandmasend {peer_version}, you run {VERSION}. \
+             This copy may be outdated."
+        );
+    }
 }
 
 fn humanize_age(created_unix: u64) -> String {
