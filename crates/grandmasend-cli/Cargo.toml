@@ -1,0 +1,21 @@
+[package]
+name = "grandmasend-cli"
+description = "Send any file, any size, to anyone who can type one command"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "grandmasend"
+path = "src/main.rs"
+
+[dependencies]
+grandmasend-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+console.workspace = true
+indicatif.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
