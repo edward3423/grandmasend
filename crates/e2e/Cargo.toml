@@ -9,11 +9,8 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-anyhow.workspace = true
-tokio.workspace = true
-
-[dev-dependencies]
-grandmasend-core.workspace = true
 blake3.workspace = true
 rand.workspace = true
+
+[dev-dependencies]
 tempfile = "3"

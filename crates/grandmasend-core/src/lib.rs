@@ -5,4 +5,8 @@
 //! hello/ack control protocol, binding, and persistence around it.
 
 pub mod code;
+pub mod events;
+pub mod hello;
 pub mod identity;
+pub mod receiver;
+pub mod sender;

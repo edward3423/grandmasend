@@ -806,12 +806,9 @@ dependencies = [
 name = "e2e"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "blake3",
- "grandmasend-core",
  "rand",
  "tempfile",
- "tokio",
 ]
 
 [[package]]
@@ -1171,6 +1168,7 @@ dependencies = [
  "console",
  "grandmasend-core",
  "indicatif",
+ "serde_json",
  "tokio",
  "tracing-subscriber",
 ]

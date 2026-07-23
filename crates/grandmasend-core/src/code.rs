@@ -118,8 +118,12 @@ mod tests {
     #[test]
     fn parse_rejects_bad_input() {
         assert!("abacus abdomen abdominal".parse::<Code>().is_err());
-        assert!("abacus abdomen abdominal abide extra".parse::<Code>().is_err());
-        assert!("abacus abdomen abdominal zzzznotaword".parse::<Code>().is_err());
+        assert!("abacus abdomen abdominal abide extra"
+            .parse::<Code>()
+            .is_err());
+        assert!("abacus abdomen abdominal zzzznotaword"
+            .parse::<Code>()
+            .is_err());
         assert!("".parse::<Code>().is_err());
     }
 
