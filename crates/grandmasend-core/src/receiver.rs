@@ -22,6 +22,7 @@ use iroh_blobs::{
     store::fs::FsStore,
     Hash, HashAndFormat,
 };
+use iroh_mdns_address_lookup::MdnsAddressLookup;
 use n0_future::StreamExt;
 use tokio::sync::mpsc;
 
@@ -53,10 +54,13 @@ pub async fn receive(
     // The persistent identity is what binding and resume recognize: every
     // run from this machine redeems the code as the same NodeId.
     let secret = identity::load_or_create_receiver_key(&config.data_dir)?;
+    // Race DNS (internet) and mDNS (LAN) lookups for the code-derived
+    // NodeId; whichever answers first wins (Q6).
     let endpoint = Endpoint::builder(presets::N0)
         .alpns(vec![])
         .secret_key(secret)
         .address_lookup(DnsAddressLookup::n0_dns())
+        .address_lookup(MdnsAddressLookup::builder().advertise(false))
         .bind()
         .await?;
 
@@ -132,6 +136,21 @@ async fn fetch_and_export(
     events: &mpsc::Sender<ReceiverEvent>,
 ) -> Result<PathBuf> {
     let local = db.remote().local(content).await?;
+
+    // Free-space preflight: hard refusal with a plain-language message
+    // before a single byte moves. Staged export renames in place, so the
+    // remaining fetch is all the space this transfer will take.
+    let needed = offer.payload_size.saturating_sub(local.local_bytes());
+    if let Ok(free) = fs4::available_space(&config.dest) {
+        anyhow::ensure!(
+            free > needed,
+            "Not enough space on this disk: the transfer needs {} more, \
+             but only {} is free. Make room, then run the same command again.",
+            human_bytes(needed),
+            human_bytes(free),
+        );
+    }
+
     events
         .send(ReceiverEvent::OfferReceived {
             name: offer.name.clone(),
@@ -182,11 +201,13 @@ async fn fetch_and_export(
             // Re-export after an interrupted export: overwrite staging only.
             tokio::fs::remove_file(&target).await?;
         }
+        // TryReference moves store-owned files instead of copying: peak disk
+        // usage stays one payload, never two.
         let mut stream = db
             .export_with_opts(ExportOptions {
                 hash: *hash,
                 target,
-                mode: ExportMode::Copy,
+                mode: ExportMode::TryReference,
             })
             .stream()
             .await;
@@ -201,13 +222,14 @@ async fn fetch_and_export(
         }
     }
 
-    let staged = staging.join(&offer.name);
+    let safe_name = sanitize_component(&offer.name);
+    let staged = staging.join(&safe_name);
     anyhow::ensure!(
         staged.exists(),
         "export finished but staged payload {} is missing",
         staged.display()
     );
-    let final_dest = claim_dest(&config.dest, &offer.name)?;
+    let final_dest = claim_dest(&config.dest, &safe_name)?;
     tokio::fs::rename(&staged, &final_dest)
         .await
         .with_context(|| format!("moving payload into {}", final_dest.display()))?;
@@ -219,8 +241,8 @@ async fn fetch_and_export(
     Ok(final_dest)
 }
 
-/// Resolve a collection entry name to a path under `root`, rejecting
-/// separator tricks.
+/// Resolve a collection entry name to a path under `root`: traversal is
+/// rejected outright, every component is sanitized for the local filesystem.
 fn entry_path(root: &Path, name: &str) -> Result<PathBuf> {
     let mut path = root.to_path_buf();
     for part in name.split('/') {
@@ -228,9 +250,55 @@ fn entry_path(root: &Path, name: &str) -> Result<PathBuf> {
             !part.is_empty() && part != "." && part != ".." && !part.contains('\\'),
             "invalid path component {part:?} in collection"
         );
-        path.push(part);
+        path.push(sanitize_component(part));
     }
     Ok(path)
+}
+
+/// Windows reserved device names; also refused on other platforms so a
+/// folder receives identically everywhere.
+const RESERVED_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Make one path component safe on every supported filesystem: control and
+/// Windows-illegal characters become '_', trailing dots/spaces are trimmed,
+/// reserved device names are prefixed. Never returns an empty string.
+fn sanitize_component(part: &str) -> String {
+    let mut cleaned: String = part
+        .chars()
+        .map(|c| match c {
+            '\0'..='\x1f' | '<' | '>' | ':' | '"' | '|' | '?' | '*' | '/' | '\\' => '_',
+            c => c,
+        })
+        .collect();
+    while cleaned.ends_with('.') || cleaned.ends_with(' ') {
+        cleaned.pop();
+    }
+    if cleaned.is_empty() {
+        return "_".to_string();
+    }
+    let stem = cleaned.split('.').next().unwrap_or("").to_ascii_uppercase();
+    if RESERVED_NAMES.contains(&stem.as_str()) {
+        cleaned.insert(0, '_');
+    }
+    cleaned
+}
+
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// Claim the destination name, strict collision policy: if ANY entry with
@@ -308,5 +376,24 @@ mod tests {
         assert!(entry_path(root, "a//b").is_err());
         assert!(entry_path(root, "a\\b").is_err());
         assert!(entry_path(root, "ok/name.txt").is_ok());
+    }
+
+    #[test]
+    fn sanitize_component_cases() {
+        assert_eq!(sanitize_component("normal.txt"), "normal.txt");
+        assert_eq!(sanitize_component("a<b>c:d.txt"), "a_b_c_d.txt");
+        assert_eq!(sanitize_component("trailing. . "), "trailing");
+        assert_eq!(sanitize_component("..."), "_");
+        assert_eq!(sanitize_component("CON"), "_CON");
+        assert_eq!(sanitize_component("con.txt"), "_con.txt");
+        assert_eq!(sanitize_component("console.txt"), "console.txt");
+        assert_eq!(sanitize_component("tab\there"), "tab_here");
+    }
+
+    #[test]
+    fn human_bytes_formatting() {
+        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(human_bytes(1_500_000), "1.5 MB");
+        assert_eq!(human_bytes(2_000_000_000), "2.0 GB");
     }
 }

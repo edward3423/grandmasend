@@ -10,9 +10,11 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+fs4 = "1.1.0"
 futures-buffered.workspace = true
 iroh.workspace = true
 iroh-blobs.workspace = true
+iroh-mdns-address-lookup = "0.4.0"
 n0-future.workspace = true
 num_cpus.workspace = true
 rand.workspace = true

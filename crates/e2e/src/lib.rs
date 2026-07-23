@@ -1,8 +1,11 @@
 //! Shared helpers for grandmasend end-to-end tests: locating the binary,
 //! driving sender/receiver processes, and payload utilities.
 
+pub mod chaos;
+
 use std::{
     io::{BufRead, BufReader, Read},
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::mpsc,
@@ -289,6 +292,42 @@ pub fn write_random_payload(path: &Path, size: u64) -> blake3::Hash {
     }
     file.flush().expect("flush payload");
     hasher.finalize()
+}
+
+/// The sender's first direct IPv4 address from its ADDR JSON.
+pub fn first_ipv4(addr_json: &str) -> SocketAddr {
+    let value: serde_json::Value = serde_json::from_str(addr_json).expect("valid ADDR json");
+    value["addrs"]
+        .as_array()
+        .expect("addrs array")
+        .iter()
+        .filter_map(|entry| entry.get("Ip"))
+        .filter_map(|ip| ip.as_str())
+        .filter_map(|ip| ip.parse::<SocketAddr>().ok())
+        .find(|addr| addr.is_ipv4())
+        .expect("sender has an IPv4 address")
+}
+
+/// Rewrite an ADDR JSON so the only route to the sender is `via`.
+pub fn addr_via(addr_json: &str, via: SocketAddr) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(addr_json).expect("valid ADDR json");
+    value["addrs"] = serde_json::json!([{ "Ip": via.to_string() }]);
+    value.to_string()
+}
+
+/// Rewrite an ADDR JSON keeping only relay routes: forces the relay path.
+pub fn addr_relay_only(addr_json: &str) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(addr_json).expect("valid ADDR json");
+    let relays: Vec<serde_json::Value> = value["addrs"]
+        .as_array()
+        .expect("addrs array")
+        .iter()
+        .filter(|entry| entry.get("Relay").is_some())
+        .cloned()
+        .collect();
+    assert!(!relays.is_empty(), "sender has no relay address");
+    value["addrs"] = serde_json::Value::Array(relays);
+    value.to_string()
 }
 
 /// BLAKE3 of a file on disk.

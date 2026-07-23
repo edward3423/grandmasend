@@ -31,6 +31,7 @@ use iroh_blobs::{
     store::fs::FsStore,
     BlobFormat, BlobsProtocol,
 };
+use iroh_mdns_address_lookup::MdnsAddressLookup;
 use n0_future::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 use walkdir::WalkDir;
@@ -105,6 +106,9 @@ pub async fn send(config: SendConfig, events: mpsc::Sender<SenderEvent>) -> Resu
     let file_count = collection.len() as u64;
     let name = payload_name(&config.path)?;
 
+    // The code-derived NodeId is announced through BOTH channels: pkarr
+    // (relay/DNS, internet) and mDNS (LAN). The receiver races them; offline
+    // is not a mode, mDNS just wins the race (Q6).
     let endpoint = Endpoint::builder(presets::N0)
         .alpns(vec![
             iroh_blobs::protocol::ALPN.to_vec(),
@@ -112,6 +116,7 @@ pub async fn send(config: SendConfig, events: mpsc::Sender<SenderEvent>) -> Resu
         ])
         .secret_key(secret)
         .address_lookup(PkarrPublisher::n0_dns())
+        .address_lookup(MdnsAddressLookup::builder())
         .bind()
         .await?;
 
