@@ -1,4 +1,8 @@
-use std::path::PathBuf;
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -8,6 +12,7 @@ use grandmasend_core::{
     events::{ReceiverEvent, SenderEvent},
     receiver::{self, ReceiveConfig},
     sender::{self, SendConfig},
+    state::{self, SendState},
 };
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use tokio::sync::mpsc;
@@ -43,6 +48,8 @@ enum Commands {
         #[clap(long, hide = true)]
         sender_addr: Option<String>,
     },
+    /// List sends that are still waiting for a receiver.
+    Status,
 }
 
 #[tokio::main]
@@ -56,29 +63,130 @@ async fn main() -> Result<()> {
             dest,
             sender_addr,
         } => receive(code, dest, sender_addr).await,
+        Commands::Status => status(),
     }
 }
 
+/// App data root; GRANDMASEND_DATA_DIR overrides for tests.
 fn data_root() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("GRANDMASEND_DATA_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .context("cannot locate home directory")?;
     Ok(PathBuf::from(home).join(".local/share/grandmasend"))
 }
 
+/// Trailing-window transfer speed: rate and ETA averaged over the last 10 s.
+struct SpeedWindow {
+    samples: VecDeque<(Instant, u64)>,
+}
+
+impl SpeedWindow {
+    const WINDOW: Duration = Duration::from_secs(10);
+
+    fn new() -> Self {
+        Self {
+            samples: VecDeque::new(),
+        }
+    }
+
+    /// Record the current position and return (bytes/s, eta) over the window.
+    fn update(&mut self, position: u64, total: u64) -> (u64, Option<Duration>) {
+        let now = Instant::now();
+        self.samples.push_back((now, position));
+        while let Some((t, _)) = self.samples.front() {
+            if now.duration_since(*t) > Self::WINDOW && self.samples.len() > 2 {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
+        }
+        let (t0, p0) = *self.samples.front().unwrap();
+        let dt = now.duration_since(t0).as_secs_f64();
+        if dt < 0.2 {
+            return (0, None);
+        }
+        let rate = ((position.saturating_sub(p0)) as f64 / dt) as u64;
+        let eta = (rate > 0)
+            .then(|| Duration::from_secs_f64(total.saturating_sub(position) as f64 / rate as f64));
+        (rate, eta)
+    }
+}
+
+fn progress_bar(total: u64) -> ProgressBar {
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} {msg}",
+        )
+        .unwrap()
+        .progress_chars("#>-"),
+    );
+    pb
+}
+
+fn speed_message(rate: u64, eta: Option<Duration>) -> String {
+    let mbps = (rate as f64 * 8.0) / 1_000_000.0;
+    match eta {
+        Some(eta) => format!("{mbps:.1} Mbps eta {}", indicatif::HumanDuration(eta)),
+        None => format!("{mbps:.1} Mbps"),
+    }
+}
+
 async fn send(path: PathBuf, print_addr: bool) -> Result<()> {
-    let (tx, mut rx) = mpsc::channel(32);
-    // Per-send data dir; suffix keeps concurrent sends isolated.
-    let send_id = std::process::id();
-    let data_dir = data_root()?.join(format!("send-{send_id}"));
+    let data_root = data_root()?;
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("cannot access {}", path.display()))?;
+
+    // Revival: an interrupted send for the same payload keeps its code and
+    // its binding; the receiver can resume as if nothing happened.
+    let revived = state::find_by_path(&data_root, &canonical)?;
+    let (code, bound) = match &revived {
+        Some(prior) => {
+            let code: Code = prior.code.parse().context("saved send has invalid code")?;
+            eprintln!(
+                "Resuming previous send for {} (started {}).",
+                style(canonical.display()).bold(),
+                humanize_age(prior.created),
+            );
+            (code, prior.bound_id())
+        }
+        None => (Code::generate(), None),
+    };
+
+    state::save(
+        &data_root,
+        &SendState {
+            code: code.canonical(),
+            path: canonical.clone(),
+            bound: bound.map(|id| id.to_string()),
+            created: revived
+                .as_ref()
+                .map(|p| p.created)
+                .unwrap_or_else(state::now_unix),
+        },
+    )?;
+
+    let (tx, mut rx) = mpsc::channel(256);
     let config = SendConfig {
-        path,
-        code: None,
-        data_dir: data_dir.clone(),
+        path: canonical.clone(),
+        code: Some(code.clone()),
+        bound,
+        data_dir: state::store_dir(&data_root, &code),
         version: VERSION.to_string(),
     };
 
+    let state_root = data_root.clone();
+    let state_code = code.canonical();
+    let state_path = canonical.clone();
+    let state_created = revived.map(|p| p.created).unwrap_or_else(state::now_unix);
     let ui = tokio::spawn(async move {
+        let mut bar: Option<ProgressBar> = None;
+        let mut speed = SpeedWindow::new();
+        let mut total = 0u64;
         while let Some(event) = rx.recv().await {
             match event {
                 SenderEvent::Ready {
@@ -89,6 +197,7 @@ async fn send(path: PathBuf, print_addr: bool) -> Result<()> {
                     addr,
                     ..
                 } => {
+                    total = payload_size;
                     eprintln!(
                         "Offering {} ({}, {} file{})",
                         style(&name).bold(),
@@ -112,7 +221,30 @@ async fn send(path: PathBuf, print_addr: bool) -> Result<()> {
                         id.fmt_short()
                     );
                 }
+                SenderEvent::Bound { id } => {
+                    // Persist the binding so a revived send only serves the
+                    // same receiver.
+                    state::save(
+                        &state_root,
+                        &SendState {
+                            code: state_code.clone(),
+                            path: state_path.clone(),
+                            bound: Some(id.to_string()),
+                            created: state_created,
+                        },
+                    )
+                    .ok();
+                }
+                SenderEvent::ServeProgress { bytes } => {
+                    let pb = bar.get_or_insert_with(|| progress_bar(total));
+                    let (rate, eta) = speed.update(bytes, total);
+                    pb.set_position(bytes.min(total));
+                    pb.set_message(speed_message(rate, eta));
+                }
                 SenderEvent::Completed { payload_size } => {
+                    if let Some(pb) = bar.take() {
+                        pb.finish_and_clear();
+                    }
                     eprintln!(
                         "{} {} delivered and verified.",
                         style("Done.").bold().green(),
@@ -126,14 +258,17 @@ async fn send(path: PathBuf, print_addr: bool) -> Result<()> {
     let result = tokio::select! {
         r = sender::send(config, tx) => r.map(|_| ()),
         _ = tokio::signal::ctrl_c() => {
-            eprintln!("\nStopped. The code is no longer being served.");
-            Ok(())
+            eprintln!();
+            eprintln!("Stopped. Run the same send again to revive this code.");
+            ui.abort();
+            return Ok(());
         }
     };
-    // The per-send store holds only references plus small metadata; remove it
-    // on any exit. Revival across reruns arrives with persistent send state.
-    tokio::fs::remove_dir_all(&data_dir).await.ok();
     ui.abort();
+    // Completion consumed the code; failure keeps state for revival.
+    if result.is_ok() {
+        state::remove(&data_root, &code)?;
+    }
     result
 }
 
@@ -156,17 +291,41 @@ async fn receive(
     let config = ReceiveConfig {
         code,
         dest,
+        data_dir: data_root()?,
         version: VERSION.to_string(),
         sender_addr,
     };
 
     let ui = tokio::spawn(async move {
         let mut bar: Option<ProgressBar> = None;
+        let mut speed = SpeedWindow::new();
         let mut resumed = 0u64;
-        while let Some(event) = rx.recv().await {
+        let mut total = 0u64;
+        let mut waiting_since: Option<Instant> = None;
+        let mut hint = tokio::time::interval(Duration::from_secs(60));
+        hint.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        hint.reset();
+        loop {
+            let event = tokio::select! {
+                event = rx.recv() => match event {
+                    Some(event) => event,
+                    None => break,
+                },
+                _ = hint.tick(), if waiting_since.is_some() => {
+                    // Wrong-but-valid codes look exactly like an offline
+                    // sender; nudge the humans to compare codes.
+                    eprintln!(
+                        "Still waiting - if the sender says they're online, \
+                         double-check the code together."
+                    );
+                    continue;
+                }
+            };
             match event {
                 ReceiverEvent::Connecting => {
                     eprintln!("Looking for the sender...");
+                    waiting_since = Some(Instant::now());
+                    hint.reset();
                 }
                 ReceiverEvent::OfferReceived {
                     name,
@@ -174,6 +333,7 @@ async fn receive(
                     file_count,
                     resumed_bytes,
                 } => {
+                    waiting_since = None;
                     eprintln!(
                         "Receiving {} ({}, {} file{})",
                         style(&name).bold(),
@@ -185,20 +345,17 @@ async fn receive(
                         eprintln!("Resuming: {} already here.", HumanBytes(resumed_bytes));
                     }
                     resumed = resumed_bytes;
-                    let pb = ProgressBar::new(payload_size);
-                    pb.set_style(
-                        ProgressStyle::with_template(
-                            "[{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} {binary_bytes_per_sec} eta {eta}",
-                        )
-                        .unwrap()
-                        .progress_chars("#>-"),
-                    );
+                    total = payload_size;
+                    let pb = progress_bar(payload_size);
                     pb.set_position(resumed_bytes);
                     bar = Some(pb);
                 }
                 ReceiverEvent::Progress { offset } => {
                     if let Some(pb) = &bar {
-                        pb.set_position(resumed + offset);
+                        let position = (resumed + offset).min(total);
+                        let (rate, eta) = speed.update(position, total);
+                        pb.set_position(position);
+                        pb.set_message(speed_message(rate, eta));
                     }
                 }
                 ReceiverEvent::Exporting => {
@@ -227,6 +384,38 @@ async fn receive(
     };
     ui.abort();
     result
+}
+
+fn status() -> Result<()> {
+    let sends = state::list(&data_root()?)?;
+    if sends.is_empty() {
+        eprintln!("No sends waiting.");
+        return Ok(());
+    }
+    for send in sends {
+        let bound = match send.bound {
+            Some(_) => "receiver bound",
+            None => "no receiver yet",
+        };
+        eprintln!(
+            "{}  {}  ({}, started {})",
+            style(&send.code).bold().green(),
+            send.path.display(),
+            bound,
+            humanize_age(send.created),
+        );
+    }
+    Ok(())
+}
+
+fn humanize_age(created_unix: u64) -> String {
+    let age = state::now_unix().saturating_sub(created_unix);
+    match age {
+        0..=59 => "moments ago".to_string(),
+        60..=3599 => format!("{} min ago", age / 60),
+        3600..=86399 => format!("{} h ago", age / 3600),
+        _ => format!("{} days ago", age / 86400),
+    }
 }
 
 fn default_downloads() -> Result<PathBuf> {

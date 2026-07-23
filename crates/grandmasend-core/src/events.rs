@@ -20,6 +20,10 @@ pub enum SenderEvent {
     },
     /// A receiver established a control connection.
     ReceiverConnected { id: EndpointId },
+    /// The first receiver redeemed the code; only this NodeId is served now.
+    Bound { id: EndpointId },
+    /// Cumulative payload bytes served this session.
+    ServeProgress { bytes: u64 },
     /// The bound receiver confirmed completion; the send is over.
     Completed { payload_size: u64 },
 }

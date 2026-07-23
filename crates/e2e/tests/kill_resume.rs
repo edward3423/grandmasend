@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use e2e::{grandmasend_bin, hash_file, run_receiver, write_random_payload, Sender};
+use e2e::{grandmasend_bin, hash_file, run_receiver, write_random_payload, ReceiverMode, Sender};
 
 const PAYLOAD_SIZE: u64 = 100 * 1024 * 1024;
 
@@ -16,12 +16,16 @@ fn kill_and_resume_100mb() {
     let bin = grandmasend_bin();
     let work = tempfile::tempdir().expect("workdir");
     let dest = work.path().join("dest");
-    std::fs::create_dir_all(&dest).expect("dest dir");
+    let sender_data = work.path().join("sender-data");
+    let receiver_data = work.path().join("receiver-data");
+    for dir in [&dest, &sender_data, &receiver_data] {
+        std::fs::create_dir_all(dir).expect("mkdir");
+    }
 
     let payload = work.path().join("payload.bin");
     let expected = write_random_payload(&payload, PAYLOAD_SIZE);
 
-    let sender = Sender::spawn(&bin, &payload);
+    let sender = Sender::spawn(&bin, &payload, &sender_data);
     assert_eq!(sender.code.split_whitespace().count(), 4, "code is 4 words");
 
     // Two mid-transfer kills at growing thresholds, then a clean run.
@@ -32,7 +36,8 @@ fn kill_and_resume_100mb() {
             &sender.code,
             &dest,
             &sender.addr_json,
-            Some(threshold),
+            &receiver_data,
+            ReceiverMode::KillAtBytes(threshold),
         );
         assert!(
             run.killed,
@@ -46,7 +51,14 @@ fn kill_and_resume_100mb() {
     }
 
     // Interrupted runs after the first must resume, not restart.
-    let final_run = run_receiver(&bin, &sender.code, &dest, &sender.addr_json, None);
+    let final_run = run_receiver(
+        &bin,
+        &sender.code,
+        &dest,
+        &sender.addr_json,
+        &receiver_data,
+        ReceiverMode::ToCompletion,
+    );
     assert!(
         final_run.success,
         "final receiver run failed:\n{}",

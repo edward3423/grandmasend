@@ -2,10 +2,16 @@
 //! identity, and exit on the receiver's completion ack.
 //!
 //! The blob serving path is stock iroh-blobs, wired exactly as sendme wires
-//! it; only the identity, the hello handler, and the completion signal are
-//! grandmasend's own.
+//! it; grandmasend adds the identity, the hello handler, the binding filter,
+//! and the completion signal.
 
-use std::path::{Component, Path, PathBuf};
+use std::{
+    path::{Component, Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+};
 
 use anyhow::{Context, Result};
 use futures_buffered::BufferedStreamExt;
@@ -13,7 +19,7 @@ use iroh::{
     address_lookup::pkarr::PkarrPublisher,
     endpoint::presets,
     protocol::{AcceptError, ProtocolHandler, Router},
-    Endpoint,
+    Endpoint, EndpointId,
 };
 use iroh_blobs::{
     api::{
@@ -21,11 +27,12 @@ use iroh_blobs::{
         Store, TempTag,
     },
     format::collection::Collection,
+    provider::events::{EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate},
     store::fs::FsStore,
     BlobFormat, BlobsProtocol,
 };
 use n0_future::StreamExt;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot};
 use walkdir::WalkDir;
 
 use crate::{
@@ -35,11 +42,16 @@ use crate::{
     identity,
 };
 
+/// QUIC close code for "this code is bound to another receiver".
+const CLOSE_NOT_BOUND: u32 = 1;
+
 pub struct SendConfig {
     /// File or folder to offer.
     pub path: PathBuf,
     /// Code to serve under; freshly generated when absent.
     pub code: Option<Code>,
+    /// Receiver NodeId bound in an earlier run of this send, if any.
+    pub bound: Option<EndpointId>,
     /// Directory for this send's blob store (references, not copies).
     pub data_dir: PathBuf,
     /// Version string exchanged in the frozen hello.
@@ -52,15 +64,32 @@ pub struct SendSummary {
     pub file_count: u64,
 }
 
+/// First NodeId to redeem the code; shared between the control handler
+/// (which sets it) and the blobs accept filter (which enforces it).
+type Binding = Arc<Mutex<Option<EndpointId>>>;
+
 /// Serve one payload until the receiver acks completion. Never times out;
 /// cancellation (ctrl-c) is the caller's job via future drop.
 pub async fn send(config: SendConfig, events: mpsc::Sender<SenderEvent>) -> Result<SendSummary> {
     let code = config.code.unwrap_or_else(Code::generate);
     let secret = identity::transfer_secret(&code);
+    let binding: Binding = Arc::new(Mutex::new(config.bound));
 
     tokio::fs::create_dir_all(&config.data_dir).await?;
     let store = FsStore::load(config.data_dir.join("store")).await?;
-    let blobs = BlobsProtocol::new(&store, None);
+
+    let (provider_tx, provider_rx) = mpsc::channel(32);
+    let blobs = BlobsProtocol::new(
+        &store,
+        Some(EventSender::new(
+            provider_tx,
+            EventMask {
+                get: RequestMode::NotifyLog,
+                ..EventMask::DEFAULT
+            },
+        )),
+    );
+    tokio::spawn(forward_serve_progress(provider_rx, events.clone()));
 
     let (temp_tag, payload_size, collection) = import(config.path.clone(), blobs.store()).await?;
     let hash = temp_tag.hash();
@@ -85,10 +114,19 @@ pub async fn send(config: SendConfig, events: mpsc::Sender<SenderEvent>) -> Resu
         name: name.clone(),
     };
     let (complete_tx, complete_rx) = oneshot::channel();
-    let control = ControlHandler::new(offer, events.clone(), complete_tx);
+    let control = ControlHandler {
+        offer,
+        events: events.clone(),
+        binding: binding.clone(),
+        complete: Mutex::new(Some(complete_tx)),
+    };
+    let bound_blobs = BoundBlobs {
+        inner: blobs.clone(),
+        binding: binding.clone(),
+    };
 
     let router = Router::builder(endpoint)
-        .accept(iroh_blobs::ALPN, blobs.clone())
+        .accept(iroh_blobs::ALPN, bound_blobs)
         .accept(hello::ALPN, control)
         .spawn();
 
@@ -131,22 +169,45 @@ pub async fn send(config: SendConfig, events: mpsc::Sender<SenderEvent>) -> Resu
     })
 }
 
+/// Translate provider request updates into a cumulative served-bytes count.
+async fn forward_serve_progress(
+    mut provider_rx: mpsc::Receiver<ProviderMessage>,
+    events: mpsc::Sender<SenderEvent>,
+) {
+    let total = Arc::new(AtomicU64::new(0));
+    while let Some(msg) = provider_rx.recv().await {
+        if let ProviderMessage::GetRequestReceivedNotify(msg) = msg {
+            let total = total.clone();
+            let events = events.clone();
+            let mut rx = msg.rx;
+            tokio::spawn(async move {
+                // end_offset is cumulative within one request; convert to
+                // deltas so concurrent requests sum correctly.
+                let mut last = 0u64;
+                while let Ok(Some(update)) = rx.recv().await {
+                    match update {
+                        RequestUpdate::Started(_) => last = 0,
+                        RequestUpdate::Progress(p) => {
+                            let delta = p.end_offset.saturating_sub(last);
+                            last = p.end_offset;
+                            let bytes = total.fetch_add(delta, Ordering::Relaxed) + delta;
+                            events.send(SenderEvent::ServeProgress { bytes }).await.ok();
+                        }
+                        RequestUpdate::Completed(_) | RequestUpdate::Aborted(_) => {}
+                    }
+                }
+            });
+        }
+    }
+}
+
 /// Handles the hello/ack control ALPN on the sender.
 #[derive(Debug)]
 struct ControlHandler {
     offer: Offer,
     events: mpsc::Sender<SenderEvent>,
+    binding: Binding,
     complete: Mutex<Option<oneshot::Sender<()>>>,
-}
-
-impl ControlHandler {
-    fn new(offer: Offer, events: mpsc::Sender<SenderEvent>, complete: oneshot::Sender<()>) -> Self {
-        Self {
-            offer,
-            events,
-            complete: Mutex::new(Some(complete)),
-        }
-    }
 }
 
 fn accept_err(e: anyhow::Error) -> AcceptError {
@@ -156,10 +217,6 @@ fn accept_err(e: anyhow::Error) -> AcceptError {
 impl ProtocolHandler for ControlHandler {
     async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), AcceptError> {
         let remote = conn.remote_id();
-        self.events
-            .send(SenderEvent::ReceiverConnected { id: remote })
-            .await
-            .ok();
         loop {
             let (mut send, mut recv) = match conn.accept_bi().await {
                 Ok(streams) => streams,
@@ -169,16 +226,44 @@ impl ProtocolHandler for ControlHandler {
             let msg: ControlMsg = hello::read_frame(&mut recv).await.map_err(accept_err)?;
             match msg {
                 ControlMsg::Hello { version: _ } => {
+                    // Binding: the first NodeId to redeem the code is the
+                    // only one this send will ever serve. A rejected
+                    // receiver sees a closed connection, indistinguishable
+                    // from a sender that is not there.
+                    let newly_bound = {
+                        let mut bound = self.binding.lock().unwrap();
+                        match *bound {
+                            None => {
+                                *bound = Some(remote);
+                                true
+                            }
+                            Some(id) if id == remote => false,
+                            Some(_) => {
+                                conn.close(CLOSE_NOT_BOUND.into(), b"not bound");
+                                return Ok(());
+                            }
+                        }
+                    };
+                    self.events
+                        .send(SenderEvent::ReceiverConnected { id: remote })
+                        .await
+                        .ok();
+                    if newly_bound {
+                        self.events
+                            .send(SenderEvent::Bound { id: remote })
+                            .await
+                            .ok();
+                    }
                     hello::write_frame(&mut send, &self.offer)
                         .await
                         .map_err(accept_err)?;
                     send.finish().ok();
                 }
                 ControlMsg::Complete { hash } => {
-                    if hash != self.offer.hash {
-                        return Err(AcceptError::from_err(std::io::Error::other(
-                            "completion for wrong hash",
-                        )));
+                    let is_bound = *self.binding.lock().unwrap() == Some(remote);
+                    if !is_bound || hash != self.offer.hash {
+                        conn.close(CLOSE_NOT_BOUND.into(), b"not bound");
+                        return Ok(());
                     }
                     hello::write_frame(&mut send, &CompleteAck {})
                         .await
@@ -186,13 +271,33 @@ impl ProtocolHandler for ControlHandler {
                     send.finish().ok();
                     // Flush the ack before the router shuts down.
                     send.stopped().await.ok();
-                    if let Some(tx) = self.complete.lock().await.take() {
+                    if let Some(tx) = self.complete.lock().unwrap().take() {
                         tx.send(()).ok();
                     }
                     return Ok(());
                 }
             }
         }
+    }
+}
+
+/// Accept filter in front of the stock blobs protocol: only the bound
+/// receiver may fetch. Data is never served before a hello has bound.
+#[derive(Debug, Clone)]
+struct BoundBlobs {
+    inner: BlobsProtocol,
+    binding: Binding,
+}
+
+impl ProtocolHandler for BoundBlobs {
+    async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), AcceptError> {
+        let remote = conn.remote_id();
+        let is_bound = *self.binding.lock().unwrap() == Some(remote);
+        if !is_bound {
+            conn.close(CLOSE_NOT_BOUND.into(), b"not bound");
+            return Ok(());
+        }
+        self.inner.accept(conn).await
     }
 }
 

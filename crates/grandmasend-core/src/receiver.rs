@@ -31,6 +31,8 @@ pub struct ReceiveConfig {
     pub code: Code,
     /// Final destination directory, typically ~/Downloads.
     pub dest: PathBuf,
+    /// App data directory holding the persistent receiver identity.
+    pub data_dir: PathBuf,
     /// Version string exchanged in the frozen hello.
     pub version: String,
     /// Dial these addresses instead of discovery. Test/debug hook only.
@@ -48,8 +50,12 @@ pub async fn receive(
     config: ReceiveConfig,
     events: mpsc::Sender<ReceiverEvent>,
 ) -> Result<ReceiveSummary> {
+    // The persistent identity is what binding and resume recognize: every
+    // run from this machine redeems the code as the same NodeId.
+    let secret = identity::load_or_create_receiver_key(&config.data_dir)?;
     let endpoint = Endpoint::builder(presets::N0)
         .alpns(vec![])
+        .secret_key(secret)
         .address_lookup(DnsAddressLookup::n0_dns())
         .bind()
         .await?;
@@ -62,15 +68,16 @@ pub async fn receive(
     events.send(ReceiverEvent::Connecting).await.ok();
 
     // Await-retry: the sender may not be online yet; a wrong-but-valid code
-    // looks identical. Keep dialing forever; the CLI layers waiting hints.
-    let control = loop {
-        match endpoint.connect(addr.clone(), hello::ALPN).await {
-            Ok(conn) => break conn,
-            Err(_) => tokio::time::sleep(Duration::from_secs(5)).await,
+    // and a binding rejection both look identical to an offline sender.
+    // Keep dialing forever; the CLI layers waiting hints.
+    let (control, offer) = loop {
+        if let Ok(conn) = endpoint.connect(addr.clone(), hello::ALPN).await {
+            if let Ok(offer) = hello::exchange_hello(&conn, &config.version).await {
+                break (conn, offer);
+            }
         }
+        tokio::time::sleep(Duration::from_secs(5)).await;
     };
-
-    let offer = hello::exchange_hello(&control, &config.version).await?;
     let hash = Hash::from_str(&offer.hash).context("offer carried an invalid hash")?;
     let content = HashAndFormat::hash_seq(hash);
 

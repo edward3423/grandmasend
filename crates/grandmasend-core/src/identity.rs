@@ -5,6 +5,9 @@
 //! the receiver to obtain the public NodeId to dial. The code-to-peer mapping
 //! is pure math; no rendezvous infrastructure exists (ADR 0002).
 
+use std::path::Path;
+
+use anyhow::{Context, Result};
 use iroh::{EndpointId, SecretKey};
 
 use crate::code::Code;
@@ -22,6 +25,50 @@ pub fn transfer_secret(code: &Code) -> SecretKey {
 /// Derive the transfer NodeId (public half) from a code. Receiver side.
 pub fn transfer_id(code: &Code) -> EndpointId {
     transfer_secret(code).public()
+}
+
+/// The receiver's persistent identity: generated once per machine, survives
+/// between runs so binding and resume recognize the same receiver.
+pub fn load_or_create_receiver_key(data_dir: &Path) -> Result<SecretKey> {
+    let path = data_dir.join("receiver.key");
+    if let Ok(hex) = std::fs::read_to_string(&path) {
+        let bytes: [u8; 32] = parse_hex32(hex.trim())
+            .with_context(|| format!("corrupt receiver key at {}", path.display()))?;
+        return Ok(SecretKey::from_bytes(&bytes));
+    }
+    let key = SecretKey::generate();
+    std::fs::create_dir_all(data_dir)?;
+    let hex: String = key.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    write_private(&path, hex.as_bytes())?;
+    Ok(key)
+}
+
+fn parse_hex32(s: &str) -> Result<[u8; 32]> {
+    anyhow::ensure!(s.len() == 64, "expected 64 hex chars, got {}", s.len());
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)?;
+    }
+    Ok(out)
+}
+
+#[cfg(unix)]
+fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
+    std::fs::write(path, contents)?;
+    Ok(())
 }
 
 #[cfg(test)]

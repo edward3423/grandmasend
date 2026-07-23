@@ -32,12 +32,14 @@ pub struct Sender {
 
 impl Sender {
     /// Spawn a sender for `payload` and wait until it prints the code and
-    /// (via the hidden debug flag) its endpoint address.
-    pub fn spawn(bin: &Path, payload: &Path) -> Self {
+    /// (via the hidden debug flag) its endpoint address. `data_dir` isolates
+    /// send state per test.
+    pub fn spawn(bin: &Path, payload: &Path, data_dir: &Path) -> Self {
         let mut child = Command::new(bin)
             .arg("send")
             .arg(payload)
             .arg("--print-addr")
+            .env("GRANDMASEND_DATA_DIR", data_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -76,6 +78,7 @@ impl Sender {
             }
         }
         let code = code.expect("sender never printed a code");
+        assert!(!code.is_empty(), "sender printed an empty code");
         let addr_json = addr_rx
             .recv_timeout(Duration::from_secs(60))
             .expect("sender never printed its address");
@@ -107,6 +110,21 @@ impl Sender {
     pub fn stderr_so_far(&self) -> Vec<String> {
         self.stderr_lines.try_iter().collect()
     }
+
+    /// Wait for the sender to exit with any status.
+    pub fn wait_exit(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait sender") {
+                return status;
+            }
+            if Instant::now() > deadline {
+                self.child.kill().ok();
+                panic!("sender did not exit within {timeout:?}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 impl Drop for Sender {
@@ -123,14 +141,25 @@ pub struct ReceiverRun {
     pub killed: bool,
 }
 
-/// Run a receiver; if `kill_at_bytes` is set, SIGKILL the process once the
-/// partial store under `dest` grows past that size.
+/// How long a receiver run is allowed to live.
+pub enum ReceiverMode {
+    /// Run until the process exits on its own.
+    ToCompletion,
+    /// SIGKILL once the partial store under dest grows past this size.
+    KillAtBytes(u64),
+    /// SIGKILL after this duration regardless of progress.
+    KillAfter(Duration),
+}
+
+/// Run a receiver process against `code`, using `data_dir` for its
+/// persistent identity.
 pub fn run_receiver(
     bin: &Path,
     code: &str,
     dest: &Path,
     addr_json: &str,
-    kill_at_bytes: Option<u64>,
+    data_dir: &Path,
+    mode: ReceiverMode,
 ) -> ReceiverRun {
     let mut cmd = Command::new(bin);
     cmd.arg("receive")
@@ -139,14 +168,15 @@ pub fn run_receiver(
         .arg(dest)
         .arg("--sender-addr")
         .arg(addr_json)
+        .env("GRANDMASEND_DATA_DIR", data_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn receiver");
     let stderr = child.stderr.take().expect("receiver stderr");
 
     let mut killed = false;
-    match kill_at_bytes {
-        Some(threshold) => {
+    match mode {
+        ReceiverMode::KillAtBytes(threshold) => {
             let partial = dest.join(".grandmasend-partial");
             let deadline = Instant::now() + Duration::from_secs(120);
             loop {
@@ -167,7 +197,22 @@ pub fn run_receiver(
                 std::thread::sleep(Duration::from_millis(2));
             }
         }
-        None => {
+        ReceiverMode::KillAfter(duration) => {
+            let deadline = Instant::now() + duration;
+            loop {
+                if child.try_wait().expect("try_wait receiver").is_some() {
+                    break;
+                }
+                if Instant::now() > deadline {
+                    child.kill().expect("kill receiver");
+                    child.wait().expect("wait receiver");
+                    killed = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        ReceiverMode::ToCompletion => {
             let deadline = Instant::now() + Duration::from_secs(300);
             while child.try_wait().expect("try_wait receiver").is_none() {
                 if Instant::now() > deadline {
@@ -192,6 +237,16 @@ pub fn run_receiver(
         success,
         killed,
     }
+}
+
+/// Send SIGINT (ctrl-c) to a process; unix only.
+#[cfg(unix)]
+pub fn interrupt(child: &Child) {
+    let status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("run kill -INT");
+    assert!(status.success(), "kill -INT failed");
 }
 
 /// Total size in bytes of all files under `dir`; 0 when it does not exist.
