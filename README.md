@@ -65,6 +65,19 @@ window open until it says Done. The code works exactly once, for the first
 receiver that redeems it. Rerunning the same send after an interruption
 revives the same code.
 
+Sending an archive? Add `--autoextract` to a single .zip, .rar, or .7z
+file and the receiver gets both the archive and an extracted folder next
+to it, with no extra steps on their side:
+
+```
+grandmasend send big.rar --autoextract --password "the archive password"
+```
+
+The password rides the same encrypted channel as the transfer itself and
+is only needed when the archive has one. Extraction is top level only,
+archives inside the archive stay as files. If extraction fails for any
+reason the receiver still gets the archive itself.
+
 Useful companions:
 
 - `grandmasend status` lists sends still waiting for a receiver

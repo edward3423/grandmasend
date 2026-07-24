@@ -56,6 +56,15 @@ pub enum ReceiverEvent {
     AckUndelivered,
     /// All bytes verified; files are being exported to the destination.
     Exporting,
+    /// The sender asked for autoextract; extraction is running.
+    Extracting { name: String },
+    /// Extraction finished; the folder sits next to the archive.
+    Extracted {
+        files: u64,
+        dest: std::path::PathBuf,
+    },
+    /// Extraction failed; the archive itself was still delivered.
+    ExtractFailed { reason: String },
     /// Export finished and the sender acknowledged completion.
     Done {
         /// Final destination the payload was exported to.

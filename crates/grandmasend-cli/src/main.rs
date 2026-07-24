@@ -39,6 +39,15 @@ enum Commands {
         /// Use this to hand the same file to a different person.
         #[clap(long)]
         fresh: bool,
+        /// The receiver extracts the archive automatically after
+        /// verification (top level only). Requires a single .zip, .rar,
+        /// or .7z file.
+        #[clap(long)]
+        autoextract: bool,
+        /// Password for the archive, forwarded to the receiver over the
+        /// encrypted channel. Requires --autoextract.
+        #[clap(long, requires = "autoextract")]
+        password: Option<String>,
         /// Print the bound endpoint address as JSON. Debug/test hook.
         #[clap(long, hide = true)]
         print_addr: bool,
@@ -86,10 +95,12 @@ async fn main() -> Result<()> {
         Commands::Send {
             path,
             fresh,
+            autoextract,
+            password,
             print_addr,
         } => {
             update::check_and_nag(VERSION, UPDATE_CHECK_TIMEOUT).await;
-            send(path, fresh, print_addr).await
+            send(path, fresh, autoextract, password, print_addr).await
         }
         Commands::Receive {
             code,
@@ -391,11 +402,25 @@ fn speed_message(rate: u64, eta: Option<Duration>) -> String {
     }
 }
 
-async fn send(path: PathBuf, fresh: bool, print_addr: bool) -> Result<()> {
+async fn send(
+    path: PathBuf,
+    fresh: bool,
+    autoextract: bool,
+    password: Option<String>,
+    print_addr: bool,
+) -> Result<()> {
     let data_root = data_root()?;
     let canonical = path
         .canonicalize()
         .with_context(|| format!("cannot access {}", path.display()))?;
+
+    if autoextract {
+        anyhow::ensure!(
+            canonical.is_file()
+                && grandmasend_core::extract::ArchiveKind::from_path(&canonical).is_some(),
+            "--autoextract needs a single .zip, .rar, or .7z file"
+        );
+    }
 
     // --fresh: explicit abandonment. The old code stops existing (its state
     // and store are removed), so a bound-but-unfinished receiver is cut
@@ -410,7 +435,8 @@ async fn send(path: PathBuf, fresh: bool, print_addr: bool) -> Result<()> {
     }
 
     // Revival: an interrupted send for the same payload keeps its code and
-    // its binding; the receiver can resume as if nothing happened.
+    // its binding; the receiver can resume as if nothing happened. Fresh
+    // command-line flags override revived autoextract settings.
     let revived = state::find_by_path(&data_root, &canonical)?;
     let (code, bound) = match &revived {
         Some(prior) => {
@@ -424,6 +450,8 @@ async fn send(path: PathBuf, fresh: bool, print_addr: bool) -> Result<()> {
         }
         None => (Code::generate(), None),
     };
+    let autoextract = autoextract || revived.as_ref().map(|p| p.autoextract).unwrap_or(false);
+    let password = password.or_else(|| revived.as_ref().and_then(|p| p.archive_password.clone()));
 
     state::save(
         &data_root,
@@ -435,6 +463,8 @@ async fn send(path: PathBuf, fresh: bool, print_addr: bool) -> Result<()> {
                 .as_ref()
                 .map(|p| p.created)
                 .unwrap_or_else(state::now_unix),
+            autoextract,
+            archive_password: password.clone(),
         },
     )?;
 
@@ -445,12 +475,16 @@ async fn send(path: PathBuf, fresh: bool, print_addr: bool) -> Result<()> {
         bound,
         data_dir: state::store_dir(&data_root, &code),
         version: VERSION.to_string(),
+        autoextract,
+        archive_password: password.clone(),
     };
 
     let state_root = data_root.clone();
     let state_code = code.canonical();
     let state_path = canonical.clone();
     let state_created = revived.map(|p| p.created).unwrap_or_else(state::now_unix);
+    let state_autoextract = autoextract;
+    let state_password = password.clone();
     let ui = tokio::spawn(async move {
         let mut bar: Option<ProgressBar> = None;
         let mut speed = SpeedWindow::new();
@@ -511,6 +545,13 @@ async fn send(path: PathBuf, fresh: bool, print_addr: bool) -> Result<()> {
                         id.fmt_short()
                     );
                     warn_if_peer_newer("receiver", &version);
+                    // Pre-autoextract receivers deliver the archive as-is.
+                    if state_autoextract && update::is_older(&version, "0.2.0") {
+                        eprintln!(
+                            "Note: the receiver runs grandmasend {version}, which does not \
+                             auto-extract yet - they will get the archive itself."
+                        );
+                    }
                 }
                 SenderEvent::Bound { id } => {
                     // Persist the binding so a revived send only serves the
@@ -522,6 +563,8 @@ async fn send(path: PathBuf, fresh: bool, print_addr: bool) -> Result<()> {
                             path: state_path.clone(),
                             bound: Some(id.to_string()),
                             created: state_created,
+                            autoextract: state_autoextract,
+                            archive_password: state_password.clone(),
                         },
                     )
                     .ok();
@@ -678,6 +721,23 @@ async fn receive(
                         pb.finish_and_clear();
                     }
                     eprintln!("All bytes verified. Saving...");
+                }
+                ReceiverEvent::Extracting { name } => {
+                    eprintln!("Extracting {}...", style(&name).bold());
+                }
+                ReceiverEvent::Extracted { files, dest } => {
+                    eprintln!(
+                        "Extracted {} file{} to {}",
+                        files,
+                        if files == 1 { "" } else { "s" },
+                        style(dest.display()).bold()
+                    );
+                }
+                ReceiverEvent::ExtractFailed { reason } => {
+                    eprintln!(
+                        "Could not extract the archive ({reason}). \
+                         The archive itself was saved normally."
+                    );
                 }
                 ReceiverEvent::Done { dest } => {
                     eprintln!(

@@ -56,6 +56,15 @@ pub struct Offer {
     pub file_count: u64,
     /// Top-level name of the payload (file name or folder name).
     pub name: String,
+    /// ADDED in 0.2.0: the payload is a single archive the receiver should
+    /// extract after verification. Pre-0.2.0 receivers ignore this and
+    /// deliver the archive as-is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub autoextract: bool,
+    /// ADDED in 0.2.0: password for the archive, only ever sent over this
+    /// code-authenticated encrypted channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_password: Option<String>,
 }
 
 /// Sender -> receiver, reply to [`ControlMsg::Complete`]. Receiving this

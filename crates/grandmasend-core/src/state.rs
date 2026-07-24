@@ -24,6 +24,13 @@ pub struct SendState {
     pub bound: Option<String>,
     /// Unix seconds when the send was created.
     pub created: u64,
+    /// The receiver should extract the archive (autoextract send).
+    #[serde(default)]
+    pub autoextract: bool,
+    /// Archive password for autoextract, stored plainly for revival;
+    /// never printed.
+    #[serde(default)]
+    pub archive_password: Option<String>,
 }
 
 impl SendState {
@@ -127,6 +134,8 @@ mod tests {
             path: PathBuf::from("/tmp/payload"),
             bound: None,
             created: 123,
+            autoextract: false,
+            archive_password: None,
         };
         save(dir.path(), &state).unwrap();
         let listed = list(dir.path()).unwrap();
@@ -144,6 +153,8 @@ mod tests {
             path: PathBuf::from("/tmp/payload"),
             bound: None,
             created: 1,
+            autoextract: false,
+            archive_password: None,
         };
         save(dir.path(), &state).unwrap();
         assert!(find_by_path(dir.path(), Path::new("/tmp/payload"))

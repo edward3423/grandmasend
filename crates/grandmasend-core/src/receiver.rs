@@ -149,8 +149,13 @@ async fn fetch_and_export(
 
     // Free-space preflight: hard refusal with a plain-language message
     // before a single byte moves. Staged export renames in place, so the
-    // remaining fetch is all the space this transfer will take.
-    let needed = offer.payload_size.saturating_sub(local.local_bytes());
+    // remaining fetch is all the space this transfer will take - plus
+    // roughly one more payload for the extracted copy when the sender
+    // asked for autoextract (archive and contents are both kept).
+    let mut needed = offer.payload_size.saturating_sub(local.local_bytes());
+    if offer.autoextract {
+        needed = needed.saturating_add(offer.payload_size);
+    }
     if let Ok(free) = fs4::available_space(&config.dest) {
         anyhow::ensure!(
             free > needed,
@@ -248,7 +253,7 @@ async fn fetch_and_export(
         }
     }
 
-    let safe_name = sanitize_component(&offer.name);
+    let safe_name = crate::sanitize::sanitize_component(&offer.name);
     let staged = staging.join(&safe_name);
     anyhow::ensure!(
         staged.exists(),
@@ -282,52 +287,105 @@ async fn fetch_and_export(
         events.send(ReceiverEvent::AckUndelivered).await.ok();
     }
 
+    // Autoextract: strictly after the verified archive is delivered and
+    // acked. Extraction failure never fails the receive - the archive is
+    // already safe in the destination.
+    if offer.autoextract {
+        extract_delivered_archive(&final_dest, config, offer, partial_dir, events).await;
+    }
+
     Ok(final_dest)
+}
+
+/// Extract the delivered archive into a staging dir, then atomically rename
+/// the folder next to the archive (both are kept). Failures surface as an
+/// event plus the untouched archive.
+async fn extract_delivered_archive(
+    archive: &Path,
+    config: &ReceiveConfig,
+    offer: &hello::Offer,
+    partial_dir: &Path,
+    events: &mpsc::Sender<ReceiverEvent>,
+) {
+    events
+        .send(ReceiverEvent::Extracting {
+            name: offer.name.clone(),
+        })
+        .await
+        .ok();
+
+    let dir_name = crate::extract::extraction_dir_name(&offer.name);
+    let stage_out = partial_dir.join("extracted").join(&dir_name);
+    let password = offer.archive_password.clone();
+    let archive_path = archive.to_path_buf();
+    let stage_clone = stage_out.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::extract::extract_archive(&archive_path, &stage_clone, password.as_deref())
+    })
+    .await;
+
+    let extracted = match outcome {
+        Ok(Ok(extracted)) => extracted,
+        Ok(Err(cause)) => {
+            events
+                .send(ReceiverEvent::ExtractFailed {
+                    reason: format!("{cause:#}"),
+                })
+                .await
+                .ok();
+            return;
+        }
+        Err(join_error) => {
+            events
+                .send(ReceiverEvent::ExtractFailed {
+                    reason: join_error.to_string(),
+                })
+                .await
+                .ok();
+            return;
+        }
+    };
+
+    let delivered = async {
+        let folder_dest = claim_dest(&config.dest, &dir_name)?;
+        tokio::fs::rename(&stage_out, &folder_dest)
+            .await
+            .with_context(|| format!("moving extracted folder into {}", folder_dest.display()))?;
+        anyhow::Ok(folder_dest)
+    }
+    .await;
+
+    match delivered {
+        Ok(folder_dest) => {
+            events
+                .send(ReceiverEvent::Extracted {
+                    files: extracted.files,
+                    dest: folder_dest,
+                })
+                .await
+                .ok();
+        }
+        Err(cause) => {
+            events
+                .send(ReceiverEvent::ExtractFailed {
+                    reason: format!("{cause:#}"),
+                })
+                .await
+                .ok();
+        }
+    }
 }
 
 /// Resolve a collection entry name to a path under `root`: traversal is
 /// rejected outright, every component is sanitized for the local filesystem.
 fn entry_path(root: &Path, name: &str) -> Result<PathBuf> {
-    let mut path = root.to_path_buf();
     for part in name.split('/') {
         anyhow::ensure!(
             !part.is_empty() && part != "." && part != ".." && !part.contains('\\'),
             "invalid path component {part:?} in collection"
         );
-        path.push(sanitize_component(part));
     }
-    Ok(path)
-}
-
-/// Windows reserved device names; also refused on other platforms so a
-/// folder receives identically everywhere.
-const RESERVED_NAMES: [&str; 22] = [
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-];
-
-/// Make one path component safe on every supported filesystem: control and
-/// Windows-illegal characters become '_', trailing dots/spaces are trimmed,
-/// reserved device names are prefixed. Never returns an empty string.
-fn sanitize_component(part: &str) -> String {
-    let mut cleaned: String = part
-        .chars()
-        .map(|c| match c {
-            '\0'..='\x1f' | '<' | '>' | ':' | '"' | '|' | '?' | '*' | '/' | '\\' => '_',
-            c => c,
-        })
-        .collect();
-    while cleaned.ends_with('.') || cleaned.ends_with(' ') {
-        cleaned.pop();
-    }
-    if cleaned.is_empty() {
-        return "_".to_string();
-    }
-    let stem = cleaned.split('.').next().unwrap_or("").to_ascii_uppercase();
-    if RESERVED_NAMES.contains(&stem.as_str()) {
-        cleaned.insert(0, '_');
-    }
-    cleaned
+    crate::sanitize::safe_join(root, name)
 }
 
 fn human_bytes(n: u64) -> String {
@@ -420,18 +478,6 @@ mod tests {
         assert!(entry_path(root, "a//b").is_err());
         assert!(entry_path(root, "a\\b").is_err());
         assert!(entry_path(root, "ok/name.txt").is_ok());
-    }
-
-    #[test]
-    fn sanitize_component_cases() {
-        assert_eq!(sanitize_component("normal.txt"), "normal.txt");
-        assert_eq!(sanitize_component("a<b>c:d.txt"), "a_b_c_d.txt");
-        assert_eq!(sanitize_component("trailing. . "), "trailing");
-        assert_eq!(sanitize_component("..."), "_");
-        assert_eq!(sanitize_component("CON"), "_CON");
-        assert_eq!(sanitize_component("con.txt"), "_con.txt");
-        assert_eq!(sanitize_component("console.txt"), "console.txt");
-        assert_eq!(sanitize_component("tab\there"), "tab_here");
     }
 
     #[test]

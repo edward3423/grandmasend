@@ -57,6 +57,10 @@ pub struct SendConfig {
     pub data_dir: PathBuf,
     /// Version string exchanged in the frozen hello.
     pub version: String,
+    /// Ask the receiver to extract the archive after verification.
+    pub autoextract: bool,
+    /// Password for the archive, forwarded over the encrypted hello channel.
+    pub archive_password: Option<String>,
 }
 
 #[derive(Debug)]
@@ -126,6 +130,8 @@ pub async fn send(config: SendConfig, events: mpsc::Sender<SenderEvent>) -> Resu
         payload_size,
         file_count,
         name: name.clone(),
+        autoextract: config.autoextract,
+        archive_password: config.archive_password.clone(),
     };
     let (complete_tx, complete_rx) = oneshot::channel();
     let control = ControlHandler {
