@@ -450,7 +450,17 @@ async fn send(path: PathBuf, fresh: bool, print_addr: bool) -> Result<()> {
                     eprintln!("  macOS/Linux:  {}", style(&unix_command).bold());
                     eprintln!("  Windows:      {}", style(&windows_command).bold());
                     eprintln!();
-                    eprintln!("On the other machine, run grandmasend and type this code.");
+                    eprintln!("Alternatively, tell the receiver to run this command:");
+                    eprintln!(
+                        "  macOS/Linux:  {}",
+                        style("curl -fsSL https://edward3423.github.io/grandma.sh | sh").bold()
+                    );
+                    eprintln!(
+                        "  Windows:      {}",
+                        style("irm https://edward3423.github.io/grandma.ps1 | iex").bold()
+                    );
+                    eprintln!("then read the four word code for them to enter.");
+                    eprintln!();
                     eprintln!("Keep this window open until the transfer finishes.");
                     eprintln!(
                         "Press c to copy the macOS/Linux command, w to copy the Windows command."
