@@ -11,7 +11,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A tag that does not match the workspace version would ship binaries
+  # that nag themselves as outdated forever.
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$tag" != "$version" ]; then
+            echo "tag v$tag does not match workspace version $version" >&2
+            exit 1
+          fi
+
   build:
+    needs: verify-version
     strategy:
       fail-fast: false
       matrix:
