@@ -1,2 +1,4 @@
 /plan
 /target
+/.codegraph
+.DS_Store
