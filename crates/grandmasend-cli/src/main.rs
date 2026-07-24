@@ -62,6 +62,12 @@ enum Commands {
     },
     /// List sends that are still waiting for a receiver.
     Status,
+    /// Abandon one waiting send by its code: the code stops working and
+    /// cannot be revived. The payload file itself is untouched.
+    Abandon {
+        /// The four words of the send to abandon (see grandmasend status).
+        code: Vec<String>,
+    },
     /// Remove all waiting sends and interrupted-receive leftovers.
     /// Interrupted receives can no longer resume afterwards.
     Tidy {
@@ -105,11 +111,37 @@ async fn main() -> Result<()> {
             update::check_and_nag(VERSION, UPDATE_CHECK_TIMEOUT).await;
             status()
         }
+        Commands::Abandon { code } => {
+            update::check_and_nag(VERSION, UPDATE_CHECK_TIMEOUT).await;
+            abandon(code)
+        }
         Commands::Tidy { dest } => {
             update::check_and_nag(VERSION, UPDATE_CHECK_TIMEOUT).await;
             tidy(dest)
         }
     }
+}
+
+/// Abandon a single waiting send by code, without re-sending its path
+/// (send --fresh covers that case). A running sender process for this code
+/// keeps serving until stopped with ctrl-c; abandonment prevents revival.
+fn abandon(code: Vec<String>) -> Result<()> {
+    let code: Code = code.join(" ").parse()?;
+    let data_root = data_root()?;
+    let known = state::list(&data_root)?
+        .iter()
+        .any(|send| send.code == code.canonical());
+    if !known {
+        eprintln!("No waiting send with that code. See grandmasend status.");
+        return Ok(());
+    }
+    state::remove(&data_root, &code)?;
+    eprintln!(
+        "Abandoned {}. The code no longer works and cannot be revived.",
+        style(code.canonical()).green()
+    );
+    eprintln!("If a sender window is still serving it, press ctrl-c there too.");
+    Ok(())
 }
 
 /// Remove every waiting send and all receive partials: the explicit,
