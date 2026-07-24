@@ -963,7 +963,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "e2e"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "rand",
@@ -1337,7 +1337,7 @@ dependencies = [
 
 [[package]]
 name = "grandmasend-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1356,7 +1356,7 @@ dependencies = [
 
 [[package]]
 name = "grandmasend-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "blake3",
