@@ -35,6 +35,10 @@ enum Commands {
     /// Offer a file or folder; prints the four-word code to read to the receiver.
     Send {
         path: PathBuf,
+        /// Abandon any previous send of this path: new code, no binding.
+        /// Use this to hand the same file to a different person.
+        #[clap(long)]
+        fresh: bool,
         /// Print the bound endpoint address as JSON. Debug/test hook.
         #[clap(long, hide = true)]
         print_addr: bool,
@@ -65,9 +69,13 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
     match args.command {
-        Commands::Send { path, print_addr } => {
+        Commands::Send {
+            path,
+            fresh,
+            print_addr,
+        } => {
             update::check_and_nag(VERSION, UPDATE_CHECK_TIMEOUT).await;
-            send(path, print_addr).await
+            send(path, fresh, print_addr).await
         }
         Commands::Receive {
             code,
@@ -258,11 +266,23 @@ fn speed_message(rate: u64, eta: Option<Duration>) -> String {
     }
 }
 
-async fn send(path: PathBuf, print_addr: bool) -> Result<()> {
+async fn send(path: PathBuf, fresh: bool, print_addr: bool) -> Result<()> {
     let data_root = data_root()?;
     let canonical = path
         .canonicalize()
         .with_context(|| format!("cannot access {}", path.display()))?;
+
+    // --fresh: explicit abandonment. The old code stops existing (its state
+    // and store are removed), so a bound-but-unfinished receiver is cut
+    // loose and a brand-new code with no binding is generated.
+    if fresh {
+        if let Some(prior) = state::find_by_path(&data_root, &canonical)? {
+            if let Ok(code) = prior.code.parse::<Code>() {
+                state::remove(&data_root, &code)?;
+                eprintln!("Abandoned the previous send of this path; its code no longer works.");
+            }
+        }
+    }
 
     // Revival: an interrupted send for the same payload keeps its code and
     // its binding; the receiver can resume as if nothing happened.

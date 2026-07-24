@@ -38,9 +38,15 @@ impl Sender {
     /// (via the hidden debug flag) its endpoint address. `data_dir` isolates
     /// send state per test.
     pub fn spawn(bin: &Path, payload: &Path, data_dir: &Path) -> Self {
+        Self::spawn_with(bin, payload, data_dir, &[])
+    }
+
+    /// Like [`Sender::spawn`] with extra CLI flags (e.g. `--fresh`).
+    pub fn spawn_with(bin: &Path, payload: &Path, data_dir: &Path, extra: &[&str]) -> Self {
         let mut child = Command::new(bin)
             .arg("send")
             .arg(payload)
+            .args(extra)
             .arg("--print-addr")
             .env("GRANDMASEND_DATA_DIR", data_dir)
             .env("GRANDMASEND_NO_UPDATE_CHECK", "1")
