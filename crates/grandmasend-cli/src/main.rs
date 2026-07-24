@@ -62,6 +62,14 @@ enum Commands {
     },
     /// List sends that are still waiting for a receiver.
     Status,
+    /// Remove all waiting sends and interrupted-receive leftovers.
+    /// Interrupted receives can no longer resume afterwards.
+    Tidy {
+        /// Downloads directory whose partial store should be cleaned;
+        /// defaults to ~/Downloads.
+        #[clap(long)]
+        dest: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -88,27 +96,106 @@ async fn main() -> Result<()> {
             } else {
                 update::check_and_nag(VERSION, UPDATE_CHECK_TIMEOUT).await;
             }
+            eprintln!(
+                "Only receive files from people you trust. Press ctrl-c to stop the transfer."
+            );
             receive(code, dest, sender_addr).await
         }
         Commands::Status => {
             update::check_and_nag(VERSION, UPDATE_CHECK_TIMEOUT).await;
             status()
         }
+        Commands::Tidy { dest } => {
+            update::check_and_nag(VERSION, UPDATE_CHECK_TIMEOUT).await;
+            tidy(dest)
+        }
     }
 }
 
-/// The one-command receive line for a code, ready to paste.
+/// Remove every waiting send and all receive partials: the explicit,
+/// user-invoked cleanup for abandoned transfers. Nothing expires on its own.
+fn tidy(dest: Option<PathBuf>) -> Result<()> {
+    let data_root = data_root()?;
+    let mut removed_anything = false;
+
+    for send in state::list(&data_root)? {
+        if let Ok(code) = send.code.parse::<Code>() {
+            state::remove(&data_root, &code)?;
+            eprintln!(
+                "Removed waiting send: {} ({})",
+                style(&send.code).green(),
+                send.path.display()
+            );
+            removed_anything = true;
+        }
+    }
+
+    let dest = match dest {
+        Some(d) => d,
+        None => default_downloads()?,
+    };
+    let partial_root = dest.join(".grandmasend-partial");
+    if partial_root.exists() {
+        let mut freed = 0u64;
+        if let Ok(entries) = std::fs::read_dir(&partial_root) {
+            for entry in entries.flatten() {
+                freed += dir_size(&entry.path());
+            }
+        }
+        std::fs::remove_dir_all(&partial_root)
+            .with_context(|| format!("removing {}", partial_root.display()))?;
+        eprintln!(
+            "Removed interrupted-receive data: {} freed in {}",
+            HumanBytes(freed),
+            partial_root.display()
+        );
+        removed_anything = true;
+    }
+
+    if removed_anything {
+        eprintln!(
+            "Note: interrupted transfers can no longer resume; completed files are untouched."
+        );
+    } else {
+        eprintln!("Nothing to tidy.");
+    }
+    Ok(())
+}
+
+/// Total size in bytes of all files under `dir`.
+fn dir_size(dir: &std::path::Path) -> u64 {
+    let mut total = 0;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                total += dir_size(&path);
+            } else if let Ok(meta) = entry.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+/// The one-command receive line for a code, macOS/Linux, ready to paste.
 fn receive_command(code: &Code) -> String {
     let hyphenated = code.canonical().replace(' ', "-");
+    format!("curl -fsSL https://edward3423.github.io/grandma.sh | sh -s -- {hyphenated}")
+}
+
+/// The one-command receive line for a code, Windows PowerShell.
+fn receive_command_windows(code: &Code) -> String {
     format!(
-        "curl -fsSL https://github.com/edward3423/grandmasend/releases/latest/download/bootstrap.sh | sh -s -- {hyphenated}"
+        "$env:GRANDMASEND_CODE='{}'; irm https://edward3423.github.io/grandma.ps1 | iex",
+        code.canonical()
     )
 }
 
-/// Keyboard listener while serving: 'c' copies the receive command to the
-/// clipboard (OSC 52); ctrl-c is re-raised so the main loop still sees it.
-/// Adapted from sendme's clipboard handling.
-fn spawn_clipboard_keys(command: String) {
+/// Keyboard listener while serving: 'c' copies the macOS/Linux receive
+/// command, 'w' the Windows one (OSC 52); ctrl-c is re-raised so the main
+/// loop still sees it. Adapted from sendme's clipboard handling.
+fn spawn_clipboard_keys(unix_command: String, windows_command: String) {
     use crossterm::{
         event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
         terminal::{disable_raw_mode, enable_raw_mode},
@@ -132,7 +219,13 @@ fn spawn_clipboard_keys(command: String) {
                         modifiers: KeyModifiers::NONE,
                         kind: KeyEventKind::Press,
                         ..
-                    })) => copy_to_clipboard(&command),
+                    })) => copy_to_clipboard(&unix_command, "macOS/Linux"),
+                    Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Char('w'),
+                        modifiers: KeyModifiers::NONE,
+                        kind: KeyEventKind::Press,
+                        ..
+                    })) => copy_to_clipboard(&windows_command, "Windows"),
                     Ok(Event::Key(KeyEvent {
                         code: KeyCode::Char('c'),
                         modifiers: KeyModifiers::CONTROL,
@@ -150,13 +243,13 @@ fn spawn_clipboard_keys(command: String) {
     });
 }
 
-fn copy_to_clipboard(command: &str) {
+fn copy_to_clipboard(command: &str, label: &str) {
     use crossterm::{clipboard::CopyToClipboard, execute};
     match execute!(
         std::io::stdout(),
         CopyToClipboard::to_clipboard_from(command)
     ) {
-        Ok(()) => eprint!("Copied the receive command to the clipboard.\r\n"),
+        Ok(()) => eprint!("Copied the {label} receive command to the clipboard.\r\n"),
         Err(cause) => eprint!("Could not copy to clipboard: {cause}\r\n"),
     }
 }
@@ -348,18 +441,21 @@ async fn send(path: PathBuf, fresh: bool, print_addr: bool) -> Result<()> {
                         file_count,
                         if file_count == 1 { "" } else { "s" },
                     );
-                    let command = receive_command(&code);
+                    let unix_command = receive_command(&code);
+                    let windows_command = receive_command_windows(&code);
                     eprintln!();
                     eprintln!("The code is:  {}", style(&code).bold().green());
-                    eprintln!(
-                        "One-command receive (macOS/Linux):  {}",
-                        style(&command).bold()
-                    );
+                    eprintln!();
+                    eprintln!("One-command receive:");
+                    eprintln!("  macOS/Linux:  {}", style(&unix_command).bold());
+                    eprintln!("  Windows:      {}", style(&windows_command).bold());
                     eprintln!();
                     eprintln!("On the other machine, run grandmasend and type this code.");
                     eprintln!("Keep this window open until the transfer finishes.");
-                    eprintln!("Press c to copy the receive command to the clipboard.");
-                    spawn_clipboard_keys(command);
+                    eprintln!(
+                        "Press c to copy the macOS/Linux command, w to copy the Windows command."
+                    );
+                    spawn_clipboard_keys(unix_command, windows_command);
                     if print_addr {
                         if let Ok(json) = serde_json::to_string(&addr) {
                             println!("ADDR {json}");
