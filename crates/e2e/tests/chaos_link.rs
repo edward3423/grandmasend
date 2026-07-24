@@ -31,7 +31,7 @@ fn lossy_link_completes() {
         &bin,
         &sender.code,
         &dest,
-        &via,
+        Some(&via),
         &receiver_data,
         ReceiverMode::ToCompletion,
     );
@@ -92,7 +92,7 @@ fn link_cut_mid_transfer_recovers() {
         &bin,
         &sender.code,
         &dest,
-        &via,
+        Some(&via),
         &receiver_data,
         ReceiverMode::ToCompletion,
     );

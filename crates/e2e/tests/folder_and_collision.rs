@@ -31,7 +31,7 @@ fn folder_transfer_with_collision() {
         &bin,
         &sender.code,
         &dest,
-        &sender.addr_json,
+        Some(&sender.addr_json),
         &receiver_data,
         ReceiverMode::ToCompletion,
     );

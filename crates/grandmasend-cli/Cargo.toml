@@ -21,3 +21,11 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde_json.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
+crossterm = { version = "0.29", features = ["event-stream", "osc52"] }
+futures = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

@@ -35,7 +35,7 @@ fn kill_and_resume_100mb() {
             &bin,
             &sender.code,
             &dest,
-            &sender.addr_json,
+            Some(&sender.addr_json),
             &receiver_data,
             ReceiverMode::KillAtBytes(threshold),
         );
@@ -55,7 +55,7 @@ fn kill_and_resume_100mb() {
         &bin,
         &sender.code,
         &dest,
-        &sender.addr_json,
+        Some(&sender.addr_json),
         &receiver_data,
         ReceiverMode::ToCompletion,
     );

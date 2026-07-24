@@ -42,7 +42,7 @@ fn binding_revival_and_single_use() {
         &bin,
         &code,
         &dest_a,
-        &sender.addr_json,
+        Some(&sender.addr_json),
         &receiver_a_data,
         ReceiverMode::KillAtBytes(5 * 1024 * 1024),
     );
@@ -57,7 +57,7 @@ fn binding_revival_and_single_use() {
         &bin,
         &code,
         &dest_b,
-        &sender.addr_json,
+        Some(&sender.addr_json),
         &receiver_b_data,
         ReceiverMode::KillAfter(Duration::from_secs(12)),
     );
@@ -91,7 +91,7 @@ fn binding_revival_and_single_use() {
         &bin,
         &code,
         &dest_b,
-        &revived.addr_json,
+        Some(&revived.addr_json),
         &receiver_b_data,
         ReceiverMode::KillAfter(Duration::from_secs(12)),
     );
@@ -106,7 +106,7 @@ fn binding_revival_and_single_use() {
         &bin,
         &code,
         &dest_a,
-        &revived.addr_json,
+        Some(&revived.addr_json),
         &receiver_a_data,
         ReceiverMode::ToCompletion,
     );

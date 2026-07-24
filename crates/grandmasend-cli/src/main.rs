@@ -75,7 +75,9 @@ async fn main() -> Result<()> {
             transient,
             sender_addr,
         } => {
-            if !transient {
+            if transient {
+                eprintln!("grandmasend v{VERSION} by edward3423");
+            } else {
                 update::check_and_nag(VERSION, UPDATE_CHECK_TIMEOUT).await;
             }
             receive(code, dest, sender_addr).await
@@ -84,6 +86,88 @@ async fn main() -> Result<()> {
             update::check_and_nag(VERSION, UPDATE_CHECK_TIMEOUT).await;
             status()
         }
+    }
+}
+
+/// The one-command receive line for a code, ready to paste.
+fn receive_command(code: &Code) -> String {
+    let hyphenated = code.canonical().replace(' ', "-");
+    format!(
+        "curl -fsSL https://github.com/edward3423/grandmasend/releases/latest/download/bootstrap.sh | sh -s -- {hyphenated}"
+    )
+}
+
+/// Keyboard listener while serving: 'c' copies the receive command to the
+/// clipboard (OSC 52); ctrl-c is re-raised so the main loop still sees it.
+/// Adapted from sendme's clipboard handling.
+fn spawn_clipboard_keys(command: String) {
+    use crossterm::{
+        event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+        terminal::{disable_raw_mode, enable_raw_mode},
+    };
+    use futures::StreamExt;
+
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return;
+    }
+
+    tokio::spawn(async move {
+        // Raw mode is restored on ctrl-c below; sendme uses the same trick.
+        if enable_raw_mode().is_err() {
+            return;
+        }
+        EventStream::new()
+            .for_each(move |event| {
+                match event {
+                    Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Char('c'),
+                        modifiers: KeyModifiers::NONE,
+                        kind: KeyEventKind::Press,
+                        ..
+                    })) => copy_to_clipboard(&command),
+                    Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Char('c'),
+                        modifiers: KeyModifiers::CONTROL,
+                        kind: KeyEventKind::Press,
+                        ..
+                    })) => {
+                        disable_raw_mode().ok();
+                        resend_interrupt();
+                    }
+                    _ => {}
+                }
+                std::future::ready(())
+            })
+            .await;
+    });
+}
+
+fn copy_to_clipboard(command: &str) {
+    use crossterm::{clipboard::CopyToClipboard, execute};
+    match execute!(
+        std::io::stdout(),
+        CopyToClipboard::to_clipboard_from(command)
+    ) {
+        Ok(()) => eprint!("Copied the receive command to the clipboard.\r\n"),
+        Err(cause) => eprint!("Could not copy to clipboard: {cause}\r\n"),
+    }
+}
+
+/// Re-deliver ctrl-c to the process so tokio's signal handler runs.
+#[cfg(unix)]
+fn resend_interrupt() {
+    // Safety: raise() just re-sends SIGINT to this process.
+    unsafe {
+        libc::raise(libc::SIGINT);
+    }
+}
+
+#[cfg(windows)]
+fn resend_interrupt() {
+    use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_C_EVENT};
+    // Safety: re-sends the ctrl-c console event to this process group.
+    unsafe {
+        GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
     }
 }
 
@@ -244,11 +328,18 @@ async fn send(path: PathBuf, print_addr: bool) -> Result<()> {
                         file_count,
                         if file_count == 1 { "" } else { "s" },
                     );
+                    let command = receive_command(&code);
                     eprintln!();
                     eprintln!("The code is:  {}", style(&code).bold().green());
+                    eprintln!(
+                        "One-command receive (macOS/Linux):  {}",
+                        style(&command).bold()
+                    );
                     eprintln!();
                     eprintln!("On the other machine, run grandmasend and type this code.");
                     eprintln!("Keep this window open until the transfer finishes.");
+                    eprintln!("Press c to copy the receive command to the clipboard.");
+                    spawn_clipboard_keys(command);
                     if print_addr {
                         if let Ok(json) = serde_json::to_string(&addr) {
                             println!("ADDR {json}");
@@ -300,12 +391,15 @@ async fn send(path: PathBuf, print_addr: bool) -> Result<()> {
     let result = tokio::select! {
         r = sender::send(config, tx) => r.map(|_| ()),
         _ = tokio::signal::ctrl_c() => {
+            crossterm::terminal::disable_raw_mode().ok();
             eprintln!();
             eprintln!("Stopped. Run the same send again to revive this code.");
             ui.abort();
             return Ok(());
         }
     };
+    // The clipboard key listener may have left the terminal in raw mode.
+    crossterm::terminal::disable_raw_mode().ok();
     ui.abort();
     // Completion consumed the code; failure keeps state for revival.
     if result.is_ok() {
@@ -345,7 +439,6 @@ async fn receive(
     let ui = tokio::spawn(async move {
         let mut bar: Option<ProgressBar> = None;
         let mut speed = SpeedWindow::new();
-        let mut resumed = 0u64;
         let mut total = 0u64;
         let mut waiting_since: Option<Instant> = None;
         let mut hint = tokio::time::interval(Duration::from_secs(60));
@@ -392,19 +485,35 @@ async fn receive(
                     if resumed_bytes > 0 {
                         eprintln!("Resuming: {} already here.", HumanBytes(resumed_bytes));
                     }
-                    resumed = resumed_bytes;
                     total = payload_size;
                     let pb = progress_bar(payload_size);
                     pb.set_position(resumed_bytes);
                     bar = Some(pb);
                 }
                 ReceiverEvent::Progress { offset } => {
+                    waiting_since = None;
                     if let Some(pb) = &bar {
-                        let position = (resumed + offset).min(total);
+                        let position = offset.min(total);
                         let (rate, eta) = speed.update(position, total);
                         pb.set_position(position);
                         pb.set_message(speed_message(rate, eta));
                     }
+                }
+                ReceiverEvent::Interrupted => {
+                    if waiting_since.is_none() {
+                        eprintln!(
+                            "Connection to the sender lost - waiting for them to come back. \
+                             Leave this window open, or press ctrl-c and rerun later to resume."
+                        );
+                        waiting_since = Some(Instant::now());
+                        hint.reset();
+                    }
+                }
+                ReceiverEvent::AckUndelivered => {
+                    eprintln!(
+                        "Note: could not confirm completion with the sender - \
+                         their side may still show the send as waiting."
+                    );
                 }
                 ReceiverEvent::Exporting => {
                     if let Some(pb) = bar.take() {

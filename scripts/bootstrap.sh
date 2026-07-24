@@ -42,10 +42,13 @@ trap cleanup EXIT INT TERM
 echo "Fetching grandmasend..." >&2
 curl -fsSL "$BASE_URL/grandmasend-$target.tar.gz" | tar -xz -C "$tmp"
 
-# Test hook: CI drives the paste-path without a terminal via env vars.
-if [ -n "${GRANDMASEND_CODE:-}" ]; then
-    # Intentional word splitting: the code is four words.
-    set -- receive --transient $GRANDMASEND_CODE
+# The code can ride along on the command itself:
+#   curl ... | sh -s -- word1-word2-word3-word4
+# GRANDMASEND_CODE serves the same purpose for CI. No code = prompt.
+code="${*:-${GRANDMASEND_CODE:-}}"
+if [ -n "$code" ]; then
+    # Intentional word splitting: the code may be four separate words.
+    set -- receive --transient $code
     [ -n "${GRANDMASEND_DEST:-}" ] && set -- "$@" --dest "$GRANDMASEND_DEST"
     [ -n "${GRANDMASEND_SENDER_ADDR:-}" ] && set -- "$@" --sender-addr "$GRANDMASEND_SENDER_ADDR"
     "$tmp/grandmasend" "$@"

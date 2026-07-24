@@ -115,6 +115,12 @@ impl Sender {
         self.stderr_lines.try_iter().collect()
     }
 
+    /// SIGKILL the sender, simulating a crash or network death.
+    pub fn kill(&mut self) {
+        self.child.kill().expect("kill sender");
+        self.child.wait().expect("wait killed sender");
+    }
+
     /// Wait for the sender to exit with any status.
     pub fn wait_exit(&mut self, timeout: Duration) -> std::process::ExitStatus {
         let deadline = Instant::now() + timeout;
@@ -156,12 +162,13 @@ pub enum ReceiverMode {
 }
 
 /// Run a receiver process against `code`, using `data_dir` for its
-/// persistent identity.
+/// persistent identity. `addr_json` pins the sender address (most tests);
+/// `None` uses real discovery, which also survives sender restarts.
 pub fn run_receiver(
     bin: &Path,
     code: &str,
     dest: &Path,
-    addr_json: &str,
+    addr_json: Option<&str>,
     data_dir: &Path,
     mode: ReceiverMode,
 ) -> ReceiverRun {
@@ -170,12 +177,13 @@ pub fn run_receiver(
         .args(code.split_whitespace())
         .arg("--dest")
         .arg(dest)
-        .arg("--sender-addr")
-        .arg(addr_json)
         .env("GRANDMASEND_DATA_DIR", data_dir)
         .env("GRANDMASEND_NO_UPDATE_CHECK", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    if let Some(addr) = addr_json {
+        cmd.arg("--sender-addr").arg(addr);
+    }
     let mut child = cmd.spawn().expect("spawn receiver");
     let stderr = child.stderr.take().expect("receiver stderr");
 

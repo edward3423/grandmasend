@@ -46,8 +46,14 @@ pub enum ReceiverEvent {
         /// The sender's binary version from the frozen hello.
         sender_version: String,
     },
-    /// Cumulative verified bytes fetched this session (excludes resumed).
+    /// Absolute verified bytes present locally (resumed + fetched).
     Progress { offset: u64 },
+    /// The connection to the sender was lost mid-transfer; the receiver
+    /// keeps waiting and resumes when the sender comes back.
+    Interrupted,
+    /// Every byte is exported but the completion ack could not be
+    /// delivered; the sender may still show the send as waiting.
+    AckUndelivered,
     /// All bytes verified; files are being exported to the destination.
     Exporting,
     /// Export finished and the sender acknowledged completion.

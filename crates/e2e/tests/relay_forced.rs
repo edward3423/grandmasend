@@ -30,7 +30,7 @@ fn relay_only_completes() {
         &bin,
         &sender.code,
         &dest,
-        &relay_only,
+        Some(&relay_only),
         &receiver_data,
         ReceiverMode::ToCompletion,
     );

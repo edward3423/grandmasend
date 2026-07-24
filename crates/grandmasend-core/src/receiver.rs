@@ -71,17 +71,7 @@ pub async fn receive(
 
     events.send(ReceiverEvent::Connecting).await.ok();
 
-    // Await-retry: the sender may not be online yet; a wrong-but-valid code
-    // and a binding rejection both look identical to an offline sender.
-    // Keep dialing forever; the CLI layers waiting hints.
-    let (control, offer) = loop {
-        if let Ok(conn) = endpoint.connect(addr.clone(), hello::ALPN).await {
-            if let Ok(offer) = hello::exchange_hello(&conn, &config.version).await {
-                break (conn, offer);
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    };
+    let (control, offer) = hello_retry(&endpoint, &addr, &config.version).await;
     let hash = Hash::from_str(&offer.hash).context("offer carried an invalid hash")?;
     let content = HashAndFormat::hash_seq(hash);
 
@@ -94,7 +84,8 @@ pub async fn receive(
 
     let result = fetch_and_export(
         &endpoint,
-        &control,
+        &addr,
+        control,
         &config,
         &offer,
         content,
@@ -124,10 +115,29 @@ pub async fn receive(
     })
 }
 
+/// Await-retry connect + hello: the sender may not be online yet; a
+/// wrong-but-valid code and a binding rejection both look identical to an
+/// offline sender. Dials forever; the CLI layers waiting hints.
+async fn hello_retry(
+    endpoint: &Endpoint,
+    addr: &EndpointAddr,
+    version: &str,
+) -> (iroh::endpoint::Connection, hello::Offer) {
+    loop {
+        if let Ok(conn) = endpoint.connect(addr.clone(), hello::ALPN).await {
+            if let Ok(offer) = hello::exchange_hello(&conn, version).await {
+                return (conn, offer);
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn fetch_and_export(
     endpoint: &Endpoint,
-    control: &iroh::endpoint::Connection,
+    addr: &EndpointAddr,
+    control: iroh::endpoint::Connection,
     config: &ReceiveConfig,
     offer: &hello::Offer,
     content: HashAndFormat,
@@ -162,27 +172,43 @@ async fn fetch_and_export(
         .await
         .ok();
 
-    if !local.is_complete() {
-        let addr = config
-            .sender_addr
-            .clone()
-            .unwrap_or_else(|| EndpointAddr::from(identity::transfer_id(&config.code)));
-        let conn = endpoint
-            .connect(addr, iroh_blobs::protocol::ALPN)
-            .await
-            .context("connecting for blob fetch")?;
-        let get = db.remote().execute_get(conn, local.missing());
-        let mut stream = get.stream();
-        while let Some(item) = stream.next().await {
-            match item {
-                GetProgressItem::Progress(offset) => {
-                    events.send(ReceiverEvent::Progress { offset }).await.ok();
-                }
-                GetProgressItem::Done(_stats) => break,
-                GetProgressItem::Error(cause) => {
-                    return Err(anyhow::Error::from(cause).context("transfer interrupted"));
+    // Fetch until every byte is verified locally. A dead sender is not an
+    // error: report the interruption, keep redialing (discovery re-resolves
+    // a revived sender's new address), resume from the verified ranges.
+    loop {
+        let local = db.remote().local(content).await?;
+        if local.is_complete() {
+            break;
+        }
+        let attempt_base = local.local_bytes();
+        let attempt = async {
+            let conn = endpoint
+                .connect(addr.clone(), iroh_blobs::protocol::ALPN)
+                .await
+                .map_err(anyhow::Error::from)?;
+            let get = db.remote().execute_get(conn, local.missing());
+            let mut stream = get.stream();
+            while let Some(item) = stream.next().await {
+                match item {
+                    GetProgressItem::Progress(offset) => {
+                        events
+                            .send(ReceiverEvent::Progress {
+                                offset: attempt_base + offset,
+                            })
+                            .await
+                            .ok();
+                    }
+                    GetProgressItem::Done(_stats) => break,
+                    GetProgressItem::Error(cause) => {
+                        return Err(anyhow::Error::from(cause));
+                    }
                 }
             }
+            anyhow::Ok(())
+        };
+        if attempt.await.is_err() {
+            events.send(ReceiverEvent::Interrupted).await.ok();
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }
 
@@ -234,9 +260,27 @@ async fn fetch_and_export(
         .await
         .with_context(|| format!("moving payload into {}", final_dest.display()))?;
 
-    hello::exchange_complete(control, &offer.hash)
+    // Deliver the completion ack. The original control connection may have
+    // died with a mid-transfer sender restart; retry on fresh connections.
+    // The payload is already safe, so an unreachable sender downgrades to a
+    // notice instead of an error.
+    let mut acked = hello::exchange_complete(&control, &offer.hash)
         .await
-        .context("delivering completion ack")?;
+        .is_ok();
+    if !acked {
+        for _ in 0..12 {
+            if let Ok(conn) = endpoint.connect(addr.clone(), hello::ALPN).await {
+                if hello::exchange_complete(&conn, &offer.hash).await.is_ok() {
+                    acked = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+    if !acked {
+        events.send(ReceiverEvent::AckUndelivered).await.ok();
+    }
 
     Ok(final_dest)
 }
